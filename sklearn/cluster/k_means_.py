@@ -9,6 +9,7 @@
 #          Olivier Grisel <olivier.grisel@ensta.org>
 #          Mathieu Blondel <mathieu@mblondel.org>
 #          Robert Layton <robertlayton@gmail.com>
+#          Flavio Martins <flaviomartins@acm.org>
 # License: BSD 3 clause
 
 import warnings
@@ -170,7 +171,8 @@ def _tolerance(X, tol):
 def k_means(X, n_clusters, init='k-means++', precompute_distances='auto',
             n_init=10, max_iter=300, verbose=False,
             tol=1e-4, random_state=None, copy_x=True, n_jobs=1,
-            algorithm="auto", return_n_iter=False):
+            algorithm="auto", return_n_iter=False,
+            metric='euclidean', metric_kwargs=None):
     """K-means clustering algorithm.
 
     Read more in the :ref:`User Guide <k_means>`.
@@ -259,6 +261,35 @@ def k_means(X, n_clusters, init='k-means++', precompute_distances='auto',
     return_n_iter : bool, optional
         Whether or not to return the number of iterations.
 
+    metric : string or callable, default 'euclidean'
+        metric to use for distance computation. Any metric from scikit-learn
+        or scipy.spatial.distance can be used.
+
+        If metric is a callable function, it is called on each
+        pair of instances (rows) and the resulting value recorded. The callable
+        should take two arrays as input and return one value indicating the
+        distance between them. This works for Scipy's metrics, but is less
+        efficient than passing the metric name as a string.
+
+        Distance matrices are not supported.
+
+        Valid values for metric are:
+
+        - from scikit-learn: ['cityblock', 'cosine', 'euclidean', 'l1', 'l2',
+          'manhattan']
+
+        - from scipy.spatial.distance: ['braycurtis', 'canberra', 'chebyshev',
+          'correlation', 'dice', 'hamming', 'jaccard', 'kulsinski',
+          'mahalanobis', 'matching', 'minkowski', 'rogerstanimoto',
+          'russellrao', 'seuclidean', 'sokalmichener', 'sokalsneath',
+          'sqeuclidean', 'yule']
+
+        See the documentation for scipy.spatial.distance for details on these
+        metrics.
+
+    metric_kwargs : dict, optional
+        Keyword arguments to pass to specified metric function.
+
     Returns
     -------
     centroid : float ndarray with shape (k, n_features)
@@ -322,14 +353,15 @@ def k_means(X, n_clusters, init='k-means++', precompute_distances='auto',
                 % n_init, RuntimeWarning, stacklevel=2)
             n_init = 1
 
-    # subtract of mean of x for more accurate distance computations
-    if not sp.issparse(X):
-        X_mean = X.mean(axis=0)
-        # The copy was already done above
-        X -= X_mean
+    if metric in ['euclidean', 'cosine']:
+        # subtract of mean of x for more accurate distance computations
+        if not sp.issparse(X):
+            X_mean = X.mean(axis=0)
+            # The copy was already done above
+            X -= X_mean
 
-        if hasattr(init, '__array__'):
-            init -= X_mean
+            if hasattr(init, '__array__'):
+                init -= X_mean
 
     # precompute squared norms of data points
     x_squared_norms = row_norms(X, squared=True)
@@ -340,10 +372,13 @@ def k_means(X, n_clusters, init='k-means++', precompute_distances='auto',
         # the right result.
         algorithm = "full"
     if algorithm == "auto":
-        algorithm = "full" if sp.issparse(X) else 'elkan'
+        algorithm = "full" if sp.issparse(X) or metric != 'euclidean' else 'elkan'
     if algorithm == "full":
         kmeans_single = _kmeans_single_lloyd
     elif algorithm == "elkan":
+        if metric != 'euclidean':
+            raise ValueError("Algorithm 'elkan' must use 'euclidean' metric, got"
+                             " %s" % str(metric))
         kmeans_single = _kmeans_single_elkan
     else:
         raise ValueError("Algorithm must be 'auto', 'full' or 'elkan', got"
@@ -356,7 +391,8 @@ def k_means(X, n_clusters, init='k-means++', precompute_distances='auto',
             labels, inertia, centers, n_iter_ = kmeans_single(
                 X, n_clusters, max_iter=max_iter, init=init, verbose=verbose,
                 precompute_distances=precompute_distances, tol=tol,
-                x_squared_norms=x_squared_norms, random_state=random_state)
+                x_squared_norms=x_squared_norms, random_state=random_state,
+                metric=metric, metric_kwargs=metric_kwargs)
             # determine if these results are the best so far
             if best_inertia is None or inertia < best_inertia:
                 best_labels = labels.copy()
@@ -372,7 +408,8 @@ def k_means(X, n_clusters, init='k-means++', precompute_distances='auto',
                                    precompute_distances=precompute_distances,
                                    x_squared_norms=x_squared_norms,
                                    # Change seed to ensure variety
-                                   random_state=seed)
+                                   random_state=seed,
+                                   metric=metric, metric_kwargs=metric_kwargs)
             for seed in seeds)
         # Get results with the lowest inertia
         labels, inertia, centers, n_iters = zip(*results)
@@ -382,10 +419,11 @@ def k_means(X, n_clusters, init='k-means++', precompute_distances='auto',
         best_centers = centers[best]
         best_n_iter = n_iters[best]
 
-    if not sp.issparse(X):
-        if not copy_x:
-            X += X_mean
-        best_centers += X_mean
+    if metric in ['euclidean', 'cosine']:
+        if not sp.issparse(X):
+            if not copy_x:
+                X += X_mean
+            best_centers += X_mean
 
     distinct_clusters = len(set(best_labels))
     if distinct_clusters < n_clusters:
@@ -403,7 +441,12 @@ def k_means(X, n_clusters, init='k-means++', precompute_distances='auto',
 def _kmeans_single_elkan(X, n_clusters, max_iter=300, init='k-means++',
                          verbose=False, x_squared_norms=None,
                          random_state=None, tol=1e-4,
-                         precompute_distances=True):
+                         precompute_distances=True,
+                         metric='euclidean', metric_kwargs=None):
+    if metric != 'euclidean':
+        raise ValueError("Algorithm 'elkan' must use 'euclidean' metric, got"
+                         " %s" % str(metric))
+
     if sp.issparse(X):
         raise TypeError("algorithm='elkan' not supported for sparse input X")
     random_state = check_random_state(random_state)
@@ -424,7 +467,8 @@ def _kmeans_single_elkan(X, n_clusters, max_iter=300, init='k-means++',
 def _kmeans_single_lloyd(X, n_clusters, max_iter=300, init='k-means++',
                          verbose=False, x_squared_norms=None,
                          random_state=None, tol=1e-4,
-                         precompute_distances=True):
+                         precompute_distances=True,
+                         metric='euclidean', metric_kwargs=None):
     """A single run of k-means, assumes preparation completed prior.
 
     Parameters
@@ -508,7 +552,8 @@ def _kmeans_single_lloyd(X, n_clusters, max_iter=300, init='k-means++',
         labels, inertia = \
             _labels_inertia(X, x_squared_norms, centers,
                             precompute_distances=precompute_distances,
-                            distances=distances)
+                            distances=distances,
+                            metric=metric, metric_kwargs=metric_kwargs)
 
         # computation of the means is also called the M-step of EM
         if sp.issparse(X):
@@ -533,18 +578,22 @@ def _kmeans_single_lloyd(X, n_clusters, max_iter=300, init='k-means++',
                       % (i, center_shift_total, tol))
             break
 
-    if center_shift_total > 0:
-        # rerun E-step in case of non-convergence so that predicted labels
-        # match cluster centers
-        best_labels, best_inertia = \
-            _labels_inertia(X, x_squared_norms, best_centers,
-                            precompute_distances=precompute_distances,
-                            distances=distances)
+    if metric in ['euclidean', 'cosine']:
+        if center_shift_total > 0:
+            # rerun E-step in case of non-convergence so that predicted labels
+            # match cluster centers
+            best_labels, best_inertia = \
+                _labels_inertia(X, x_squared_norms, best_centers,
+                                precompute_distances=precompute_distances,
+                                distances=distances,
+                                metric=metric, metric_kwargs=metric_kwargs)
+
 
     return best_labels, best_inertia, best_centers, i + 1
 
 
-def _labels_inertia_precompute_dense(X, x_squared_norms, centers, distances):
+def _labels_inertia_precompute_dense(X, x_squared_norms, centers, distances,
+                                     metric='euclidean', metric_kwargs=None):
     """Compute labels and inertia using a full distance matrix.
 
     This will overwrite the 'distances' array in-place.
@@ -577,8 +626,14 @@ def _labels_inertia_precompute_dense(X, x_squared_norms, centers, distances):
     # Breakup nearest neighbor distance computation into batches to prevent
     # memory blowup in the case of a large number of samples and clusters.
     # TODO: Once PR #7383 is merged use check_inputs=False in metric_kwargs.
-    labels, mindist = pairwise_distances_argmin_min(
-        X=X, Y=centers, metric='euclidean', metric_kwargs={'squared': True})
+    if metric == 'euclidean':
+        labels, mindist = pairwise_distances_argmin_min(
+            X=X, Y=centers, metric='euclidean', metric_kwargs={'squared': True})
+    else:
+        if metric == 'cosine':
+            metric_kwargs = None
+        labels, mindist = pairwise_distances_argmin_min(
+            X=X, Y=centers, metric=metric, metric_kwargs=metric_kwargs)
     # cython k-means code assumes int32 inputs
     labels = labels.astype(np.int32)
     if n_samples == distances.shape[0]:
@@ -589,7 +644,8 @@ def _labels_inertia_precompute_dense(X, x_squared_norms, centers, distances):
 
 
 def _labels_inertia(X, x_squared_norms, centers,
-                    precompute_distances=True, distances=None):
+                    precompute_distances=True, distances=None,
+                    metric='euclidean', metric_kwargs=None):
     """E step of the K-means EM algorithm.
 
     Compute the labels and the inertia of the given samples and centers.
@@ -630,12 +686,18 @@ def _labels_inertia(X, x_squared_norms, centers,
         distances = np.zeros(shape=(0,), dtype=X.dtype)
     # distances will be changed in-place
     if sp.issparse(X):
-        inertia = _k_means._assign_labels_csr(
-            X, x_squared_norms, centers, labels, distances=distances)
+        if metric == 'euclidean':
+            inertia = _k_means._assign_labels_csr(
+                X, x_squared_norms, centers, labels, distances=distances)
+        else:
+            return _labels_inertia_precompute_dense(X, x_squared_norms,
+                                                    centers, distances,
+                                                    metric, metric_kwargs)
     else:
         if precompute_distances:
             return _labels_inertia_precompute_dense(X, x_squared_norms,
-                                                    centers, distances)
+                                                    centers, distances,
+                                                    metric, metric_kwargs)
         inertia = _k_means._assign_labels_array(
             X, x_squared_norms, centers, labels, distances=distances)
     return labels, inertia
@@ -857,7 +919,8 @@ class KMeans(BaseEstimator, ClusterMixin, TransformerMixin):
     def __init__(self, n_clusters=8, init='k-means++', n_init=10,
                  max_iter=300, tol=1e-4, precompute_distances='auto',
                  verbose=0, random_state=None, copy_x=True,
-                 n_jobs=1, algorithm='auto'):
+                 n_jobs=1, algorithm='auto',
+                 metric='euclidean', metric_kwargs=None):
 
         self.n_clusters = n_clusters
         self.init = init
@@ -870,6 +933,8 @@ class KMeans(BaseEstimator, ClusterMixin, TransformerMixin):
         self.copy_x = copy_x
         self.n_jobs = n_jobs
         self.algorithm = algorithm
+        self.metric = metric
+        self.metric_kwargs = metric_kwargs
 
     def _check_test_data(self, X):
         X = check_array(X, accept_sparse='csr', dtype=FLOAT_DTYPES)
@@ -904,7 +969,8 @@ class KMeans(BaseEstimator, ClusterMixin, TransformerMixin):
                 precompute_distances=self.precompute_distances,
                 tol=self.tol, random_state=random_state, copy_x=self.copy_x,
                 n_jobs=self.n_jobs, algorithm=self.algorithm,
-                return_n_iter=True)
+                return_n_iter=True,
+                metric=self.metric, metric_kwargs=self.metric_kwargs)
         return self
 
     def fit_predict(self, X, y=None):
@@ -997,7 +1063,8 @@ class KMeans(BaseEstimator, ClusterMixin, TransformerMixin):
 
         X = self._check_test_data(X)
         x_squared_norms = row_norms(X, squared=True)
-        return _labels_inertia(X, x_squared_norms, self.cluster_centers_)[0]
+        return _labels_inertia(X, x_squared_norms, self.cluster_centers_,
+                               metric=self.metric, metric_kwargs=self.metric_kwargs)[0]
 
     def score(self, X, y=None):
         """Opposite of the value of X on the K-means objective.
@@ -1018,14 +1085,16 @@ class KMeans(BaseEstimator, ClusterMixin, TransformerMixin):
 
         X = self._check_test_data(X)
         x_squared_norms = row_norms(X, squared=True)
-        return -_labels_inertia(X, x_squared_norms, self.cluster_centers_)[1]
+        return -_labels_inertia(X, x_squared_norms, self.cluster_centers_,
+                                metric=self.metric, metric_kwargs=self.metric_kwargs)[1]
 
 
 def _mini_batch_step(X, x_squared_norms, centers, counts,
                      old_center_buffer, compute_squared_diff,
                      distances, random_reassign=False,
                      random_state=None, reassignment_ratio=.01,
-                     verbose=False):
+                     verbose=False,
+                     metric='euclidean', metric_kwargs=None):
     """Incremental update of the centers for the Minibatch K-Means algorithm.
 
     Parameters
@@ -1086,7 +1155,8 @@ def _mini_batch_step(X, x_squared_norms, centers, counts,
     """
     # Perform label assignment to nearest centers
     nearest_center, inertia = _labels_inertia(X, x_squared_norms, centers,
-                                              distances=distances)
+                                              distances=distances,
+                                              metric=metric, metric_kwargs=metric_kwargs)
 
     if random_reassign and reassignment_ratio > 0:
         random_state = check_random_state(random_state)
@@ -1335,11 +1405,13 @@ class MiniBatchKMeans(KMeans):
     def __init__(self, n_clusters=8, init='k-means++', max_iter=100,
                  batch_size=100, verbose=0, compute_labels=True,
                  random_state=None, tol=0.0, max_no_improvement=10,
-                 init_size=None, n_init=3, reassignment_ratio=0.01):
+                 init_size=None, n_init=3, reassignment_ratio=0.01,
+                 metric='euclidean', metric_kwargs=None):
 
         super(MiniBatchKMeans, self).__init__(
             n_clusters=n_clusters, init=init, max_iter=max_iter,
-            verbose=verbose, random_state=random_state, tol=tol, n_init=n_init)
+            verbose=verbose, random_state=random_state, tol=tol, n_init=n_init,
+            metric=metric, metric_kwargs=metric_kwargs)
 
         self.max_no_improvement = max_no_improvement
         self.batch_size = batch_size
@@ -1432,12 +1504,14 @@ class MiniBatchKMeans(KMeans):
             batch_inertia, centers_squared_diff = _mini_batch_step(
                 X_valid, x_squared_norms[validation_indices],
                 cluster_centers, counts, old_center_buffer, False,
-                distances=None, verbose=self.verbose)
+                distances=None, verbose=self.verbose,
+                metric=self.metric, metric_kwargs=self.metric_kwargs)
 
             # Keep only the best cluster centers across independent inits on
             # the common validation set
             _, inertia = _labels_inertia(X_valid, x_squared_norms_valid,
-                                         cluster_centers)
+                                         cluster_centers,
+                                         metric=self.metric, metric_kwargs=self.metric_kwargs)
             if self.verbose:
                 print("Inertia for init %d/%d: %f"
                       % (init_idx + 1, n_init, inertia))
@@ -1470,7 +1544,8 @@ class MiniBatchKMeans(KMeans):
                                  % (10 + self.counts_.min()) == 0),
                 random_state=random_state,
                 reassignment_ratio=self.reassignment_ratio,
-                verbose=self.verbose)
+                verbose=self.verbose,
+                metric=self.metric, metric_kwargs=self.metric_kwargs)
 
             # Monitor convergence and do early stopping if necessary
             if _mini_batch_convergence(
@@ -1482,11 +1557,13 @@ class MiniBatchKMeans(KMeans):
         self.n_iter_ = iteration_idx + 1
 
         if self.compute_labels:
-            self.labels_, self.inertia_ = self._labels_inertia_minibatch(X)
+            self.labels_, self.inertia_ = self._labels_inertia_minibatch(X,
+                                                                         metric=self.metric,
+                                                                         metric_kwargs=self.metric_kwargs)
 
         return self
 
-    def _labels_inertia_minibatch(self, X):
+    def _labels_inertia_minibatch(self, X, metric='euclidean', metric_kwargs=None):
         """Compute labels and inertia using mini batches.
 
         This is slightly slower than doing everything at once but preventes
@@ -1510,7 +1587,8 @@ class MiniBatchKMeans(KMeans):
         x_squared_norms = row_norms(X, squared=True)
         slices = gen_batches(X.shape[0], self.batch_size)
         results = [_labels_inertia(X[s], x_squared_norms[s],
-                                   self.cluster_centers_) for s in slices]
+                                   self.cluster_centers_,
+                                   metric=metric, metric_kwargs=metric_kwargs) for s in slices]
         labels, inertia = zip(*results)
         return np.hstack(labels), np.sum(inertia)
 
@@ -1563,11 +1641,13 @@ class MiniBatchKMeans(KMeans):
                          random_reassign=random_reassign, distances=distances,
                          random_state=self.random_state_,
                          reassignment_ratio=self.reassignment_ratio,
-                         verbose=self.verbose)
+                         verbose=self.verbose,
+                         metric=self.metric, metric_kwargs=self.metric_kwargs)
 
         if self.compute_labels:
             self.labels_, self.inertia_ = _labels_inertia(
-                X, x_squared_norms, self.cluster_centers_)
+                X, x_squared_norms, self.cluster_centers_,
+                metric=self.metric, metric_kwargs=self.metric_kwargs)
 
         return self
 
@@ -1591,4 +1671,7 @@ class MiniBatchKMeans(KMeans):
         check_is_fitted(self, 'cluster_centers_')
 
         X = self._check_test_data(X)
-        return self._labels_inertia_minibatch(X)[0]
+        return self._labels_inertia_minibatch(X,
+                                              metric=self.metric,
+                                              metric_kwargs=self.metric_kwargs)[0]
+
