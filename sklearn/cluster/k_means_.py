@@ -18,7 +18,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from ..base import BaseEstimator, ClusterMixin, TransformerMixin
-from ..metrics.pairwise import euclidean_distances
+from ..metrics.pairwise import euclidean_distances, cosine_distances
 from ..metrics.pairwise import pairwise_distances_argmin_min
 from ..utils.extmath import row_norms, squared_norm, stable_cumsum
 from ..utils.sparsefuncs_fast import assign_rows_csr
@@ -42,7 +42,8 @@ from ._k_means_elkan import k_means_elkan
 # Initialization heuristic
 
 
-def _k_init(X, n_clusters, x_squared_norms, random_state, n_local_trials=None):
+def _k_init(X, n_clusters, x_squared_norms, random_state, n_local_trials=None,
+            metric='euclidean', metric_kwargs=None):
     """Init n_clusters seeds according to k-means++
 
     Parameters
@@ -68,6 +69,35 @@ def _k_init(X, n_clusters, x_squared_norms, random_state, n_local_trials=None):
         Set to None to make the number of trials depend logarithmically
         on the number of seeds (2+log(k)); this is the default.
 
+    metric : string or callable, default 'euclidean'
+        metric to use for distance computation. Any metric from scikit-learn
+        or scipy.spatial.distance can be used.
+
+        If metric is a callable function, it is called on each
+        pair of instances (rows) and the resulting value recorded. The callable
+        should take two arrays as input and return one value indicating the
+        distance between them. This works for Scipy's metrics, but is less
+        efficient than passing the metric name as a string.
+
+        Distance matrices are not supported.
+
+        Valid values for metric are:
+
+        - from scikit-learn: ['cityblock', 'cosine', 'euclidean', 'l1', 'l2',
+          'manhattan']
+
+        - from scipy.spatial.distance: ['braycurtis', 'canberra', 'chebyshev',
+          'correlation', 'dice', 'hamming', 'jaccard', 'kulsinski',
+          'mahalanobis', 'matching', 'minkowski', 'rogerstanimoto',
+          'russellrao', 'seuclidean', 'sokalmichener', 'sokalsneath',
+          'sqeuclidean', 'yule']
+
+        See the documentation for scipy.spatial.distance for details on these
+        metrics.
+
+    metric_kwargs : dict, optional
+        Keyword arguments to pass to specified metric function.
+
     Notes
     -----
     Selects initial cluster centers for k-mean clustering in a smart way
@@ -82,7 +112,8 @@ def _k_init(X, n_clusters, x_squared_norms, random_state, n_local_trials=None):
 
     centers = np.empty((n_clusters, n_features), dtype=X.dtype)
 
-    assert x_squared_norms is not None, 'x_squared_norms None in _k_init'
+    if metric == 'euclidean':
+        assert x_squared_norms is not None, 'x_squared_norms None in _k_init'
 
     # Set the number of local seeding trials if none is given
     if n_local_trials is None:
@@ -99,9 +130,12 @@ def _k_init(X, n_clusters, x_squared_norms, random_state, n_local_trials=None):
         centers[0] = X[center_id]
 
     # Initialize list of closest distances and calculate current potential
-    closest_dist_sq = euclidean_distances(
-        centers[0, np.newaxis], X, Y_norm_squared=x_squared_norms,
-        squared=True)
+    if metric == 'euclidean':
+        closest_dist_sq = euclidean_distances(
+            centers[0, np.newaxis], X, Y_norm_squared=x_squared_norms,
+            squared=True)
+    elif metric == 'cosine':
+        closest_dist_sq = cosine_distances(centers[0, np.newaxis], X)
     current_pot = closest_dist_sq.sum()
 
     # Pick the remaining n_clusters-1 points
@@ -113,8 +147,11 @@ def _k_init(X, n_clusters, x_squared_norms, random_state, n_local_trials=None):
                                         rand_vals)
 
         # Compute distances to center candidates
-        distance_to_candidates = euclidean_distances(
-            X[candidate_ids], X, Y_norm_squared=x_squared_norms, squared=True)
+        if metric == 'euclidean':
+            distance_to_candidates = euclidean_distances(
+                X[candidate_ids], X, Y_norm_squared=x_squared_norms, squared=True)
+        elif metric == 'cosine':
+            distance_to_candidates = cosine_distances(X[candidate_ids], X)
 
         # Decide which candidate is the best
         best_candidate = None
@@ -364,7 +401,9 @@ def k_means(X, n_clusters, init='k-means++', precompute_distances='auto',
                 init -= X_mean
 
     # precompute squared norms of data points
-    x_squared_norms = row_norms(X, squared=True)
+    x_squared_norms = None
+    if metric == 'euclidean':
+        x_squared_norms = row_norms(X, squared=True)
 
     best_labels, best_inertia, best_centers = None, None, None
     if n_clusters == 1:
@@ -454,7 +493,8 @@ def _kmeans_single_elkan(X, n_clusters, max_iter=300, init='k-means++',
         x_squared_norms = row_norms(X, squared=True)
     # init
     centers = _init_centroids(X, n_clusters, init, random_state=random_state,
-                              x_squared_norms=x_squared_norms)
+                              x_squared_norms=x_squared_norms,
+                              metric=metric, metric_kwargs=metric_kwargs)
     centers = np.ascontiguousarray(centers)
     if verbose:
         print('Initialization complete')
@@ -537,7 +577,8 @@ def _kmeans_single_lloyd(X, n_clusters, max_iter=300, init='k-means++',
     best_labels, best_inertia, best_centers = None, None, None
     # init
     centers = _init_centroids(X, n_clusters, init, random_state=random_state,
-                              x_squared_norms=x_squared_norms)
+                              x_squared_norms=x_squared_norms,
+                              metric=metric, metric_kwargs=metric_kwargs)
     if verbose:
         print("Initialization complete")
 
@@ -578,15 +619,14 @@ def _kmeans_single_lloyd(X, n_clusters, max_iter=300, init='k-means++',
                       % (i, center_shift_total, tol))
             break
 
-    if metric in ['euclidean', 'cosine']:
-        if center_shift_total > 0:
-            # rerun E-step in case of non-convergence so that predicted labels
-            # match cluster centers
-            best_labels, best_inertia = \
-                _labels_inertia(X, x_squared_norms, best_centers,
-                                precompute_distances=precompute_distances,
-                                distances=distances,
-                                metric=metric, metric_kwargs=metric_kwargs)
+    if center_shift_total > 0:
+        # rerun E-step in case of non-convergence so that predicted labels
+        # match cluster centers
+        best_labels, best_inertia = \
+            _labels_inertia(X, x_squared_norms, best_centers,
+                            precompute_distances=precompute_distances,
+                            distances=distances,
+                            metric=metric, metric_kwargs=metric_kwargs)
 
 
     return best_labels, best_inertia, best_centers, i + 1
@@ -629,11 +669,9 @@ def _labels_inertia_precompute_dense(X, x_squared_norms, centers, distances,
     if metric == 'euclidean':
         labels, mindist = pairwise_distances_argmin_min(
             X=X, Y=centers, metric='euclidean', metric_kwargs={'squared': True})
-    else:
-        if metric == 'cosine':
-            metric_kwargs = None
+    elif metric == 'cosine':
         labels, mindist = pairwise_distances_argmin_min(
-            X=X, Y=centers, metric=metric, metric_kwargs=metric_kwargs)
+            X=X, Y=centers, metric='cosine', metric_kwargs=None)
     # cython k-means code assumes int32 inputs
     labels = labels.astype(np.int32)
     if n_samples == distances.shape[0]:
@@ -694,7 +732,7 @@ def _labels_inertia(X, x_squared_norms, centers,
                                                     centers, distances,
                                                     metric, metric_kwargs)
     else:
-        if precompute_distances:
+        if metric != 'euclidean' or precompute_distances:
             return _labels_inertia_precompute_dense(X, x_squared_norms,
                                                     centers, distances,
                                                     metric, metric_kwargs)
@@ -704,7 +742,7 @@ def _labels_inertia(X, x_squared_norms, centers,
 
 
 def _init_centroids(X, k, init, random_state=None, x_squared_norms=None,
-                    init_size=None):
+                    init_size=None, metric='euclidean', metric_kwargs=None):
     """Compute the initial centroids
 
     Parameters
@@ -760,7 +798,8 @@ def _init_centroids(X, k, init, random_state=None, x_squared_norms=None,
 
     if isinstance(init, string_types) and init == 'k-means++':
         centers = _k_init(X, k, random_state=random_state,
-                          x_squared_norms=x_squared_norms)
+                          x_squared_norms=x_squared_norms,
+                          metric=metric, metric_kwargs=metric_kwargs)
     elif isinstance(init, string_types) and init == 'random':
         seeds = random_state.permutation(n_samples)[:k]
         centers = X[seeds]
@@ -1040,7 +1079,10 @@ class KMeans(BaseEstimator, ClusterMixin, TransformerMixin):
 
     def _transform(self, X):
         """guts of transform method; no input validation"""
-        return euclidean_distances(X, self.cluster_centers_)
+        if self.metric == 'euclidean':
+            return euclidean_distances(X, self.cluster_centers_)
+        elif self.metric == 'cosine':
+            return cosine_distances(X, self.cluster_centers_)
 
     def predict(self, X):
         """Predict the closest cluster each sample in X belongs to.
@@ -1062,7 +1104,9 @@ class KMeans(BaseEstimator, ClusterMixin, TransformerMixin):
         check_is_fitted(self, 'cluster_centers_')
 
         X = self._check_test_data(X)
-        x_squared_norms = row_norms(X, squared=True)
+        x_squared_norms = None
+        if self.metric == 'euclidean':
+            x_squared_norms = row_norms(X, squared=True)
         return _labels_inertia(X, x_squared_norms, self.cluster_centers_,
                                metric=self.metric, metric_kwargs=self.metric_kwargs)[0]
 
@@ -1084,7 +1128,9 @@ class KMeans(BaseEstimator, ClusterMixin, TransformerMixin):
         check_is_fitted(self, 'cluster_centers_')
 
         X = self._check_test_data(X)
-        x_squared_norms = row_norms(X, squared=True)
+        x_squared_norms = None
+        if self.metric == 'euclidean':
+            x_squared_norms = row_norms(X, squared=True)
         return -_labels_inertia(X, x_squared_norms, self.cluster_centers_,
                                 metric=self.metric, metric_kwargs=self.metric_kwargs)[1]
 
@@ -1498,7 +1544,8 @@ class MiniBatchKMeans(KMeans):
                 X, self.n_clusters, self.init,
                 random_state=random_state,
                 x_squared_norms=x_squared_norms,
-                init_size=init_size)
+                init_size=init_size,
+                metric=self.metric, metric_kwargs=self.metric_kwargs)
 
             # Compute the label assignment on the init dataset
             batch_inertia, centers_squared_diff = _mini_batch_step(
@@ -1584,11 +1631,16 @@ class MiniBatchKMeans(KMeans):
         """
         if self.verbose:
             print('Computing label assignment and total inertia')
-        x_squared_norms = row_norms(X, squared=True)
         slices = gen_batches(X.shape[0], self.batch_size)
-        results = [_labels_inertia(X[s], x_squared_norms[s],
-                                   self.cluster_centers_,
-                                   metric=metric, metric_kwargs=metric_kwargs) for s in slices]
+        if metric == 'euclidean':
+            x_squared_norms = row_norms(X, squared=True)
+            results = [_labels_inertia(X[s], x_squared_norms[s],
+                                       self.cluster_centers_,
+                                       metric=metric, metric_kwargs=metric_kwargs) for s in slices]
+        else:
+            results = [_labels_inertia(X[s], None,
+                                       self.cluster_centers_,
+                                       metric=metric, metric_kwargs=metric_kwargs) for s in slices]
         labels, inertia = zip(*results)
         return np.hstack(labels), np.sum(inertia)
 
@@ -1613,7 +1665,9 @@ class MiniBatchKMeans(KMeans):
         if n_samples == 0:
             return self
 
-        x_squared_norms = row_norms(X, squared=True)
+        x_squared_norms = None
+        if self.metric == 'euclidean':
+            x_squared_norms = row_norms(X, squared=True)
         self.random_state_ = getattr(self, "random_state_",
                                      check_random_state(self.random_state))
         if (not hasattr(self, 'counts_')
@@ -1623,7 +1677,8 @@ class MiniBatchKMeans(KMeans):
             self.cluster_centers_ = _init_centroids(
                 X, self.n_clusters, self.init,
                 random_state=self.random_state_,
-                x_squared_norms=x_squared_norms, init_size=self.init_size)
+                x_squared_norms=x_squared_norms, init_size=self.init_size,
+                metric=self.metric, metric_kwargs=self.metric_kwargs)
 
             self.counts_ = np.zeros(self.n_clusters, dtype=np.int32)
             random_reassign = False
